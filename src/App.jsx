@@ -1866,6 +1866,8 @@ function ScheduleView({
   const [calMonth, setCalMonth] = useState(NOW.getMonth());
   const [quickBook, setQuickBook] = useState(null);
   const [detailBook, setDetailBook] = useState(null);
+  const [monthDragStart, setMonthDragStart] = useState(null); // date string while dragging in month view
+  const [monthDragEnd, setMonthDragEnd] = useState(null);
 
   // Drag state — stored in refs to avoid re-render storms during move
   const dragStartDate = useRef(null);
@@ -2512,14 +2514,43 @@ function ScheduleView({
               const isToday = ds === todayStr;
               const isSel = ds === selectedDate;
               const hasB = hasBookings(ds);
+              // Determine if this day is inside the current month-drag selection
+              const dragMin = monthDragStart && monthDragEnd
+                ? (monthDragStart <= monthDragEnd ? monthDragStart : monthDragEnd)
+                : null;
+              const dragMax = monthDragStart && monthDragEnd
+                ? (monthDragStart <= monthDragEnd ? monthDragEnd : monthDragStart)
+                : null;
+              const inDrag = dragMin && ds >= dragMin && ds <= dragMax;
+              const isDragStart = dragMin && ds === dragMin;
+              const isDragEnd = dragMax && ds === dragMax;
               return (
-                <button
+                <div
                   key={day}
-                  onClick={() => selectDay(ds)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setMonthDragStart(ds);
+                    setMonthDragEnd(ds);
+                  }}
+                  onMouseEnter={() => {
+                    if (monthDragStart) setMonthDragEnd(ds);
+                  }}
+                  onMouseUp={() => {
+                    if (monthDragStart) {
+                      const sd = monthDragStart <= ds ? monthDragStart : ds;
+                      const ed = monthDragStart <= ds ? ds : monthDragStart;
+                      setMonthDragStart(null);
+                      setMonthDragEnd(null);
+                      if (sd === ed) {
+                        selectDay(sd); // single tap → go to day view
+                      } else {
+                        setQuickBook({ startDate: sd, startMins: 0, endDate: ed, endMins: 1440 });
+                      }
+                    }
+                  }}
                   style={{
                     aspectRatio: '1',
                     borderRadius: 8,
-                    border: 'none',
                     cursor: 'pointer',
                     display: 'flex',
                     flexDirection: 'column',
@@ -2528,12 +2559,17 @@ function ScheduleView({
                     position: 'relative',
                     fontSize: 13,
                     fontWeight: isToday || isSel ? 800 : 400,
-                    background: isSel
+                    userSelect: 'none',
+                    background: inDrag
+                      ? themeColor + '44'
+                      : isSel
                       ? themeColor
                       : isToday
                       ? themeColor + '33'
                       : 'transparent',
-                    color: isSel ? '#000' : isToday ? themeColor : t.textMid,
+                    color: isSel ? '#000' : inDrag ? themeColor : isToday ? themeColor : t.textMid,
+                    outline: (isDragStart || isDragEnd) ? `2px solid ${themeColor}` : 'none',
+                    outlineOffset: -2,
                   }}
                 >
                   {day}
@@ -2543,25 +2579,26 @@ function ScheduleView({
                         width: 4,
                         height: 4,
                         borderRadius: '50%',
-                        background: isSel ? '#000' : themeColor,
+                        background: inDrag || isSel ? '#000' : themeColor,
                         position: 'absolute',
                         bottom: 3,
                       }}
                     />
                   )}
-                </button>
+                </div>
               );
             })}
           </div>
+          {/* Cancel month drag if mouse released outside */}
           <div
-            style={{
-              fontSize: 10,
-              color: t.textLow,
-              textAlign: 'center',
-              marginTop: 10,
-            }}
+            style={{ fontSize: 10, color: t.textLow, textAlign: 'center', marginTop: 10 }}
+            onMouseLeave={() => { if (monthDragStart) { setMonthDragStart(null); setMonthDragEnd(null); } }}
           >
-            Tap a day to see its schedule
+            {monthDragStart && monthDragEnd && monthDragStart !== monthDragEnd
+              ? `Book ${Math.abs(
+                  (new Date(monthDragEnd) - new Date(monthDragStart)) / 86400000
+                ) + 1} days`
+              : 'Tap a day · drag to book a range'}
           </div>
         </div>
       )}
@@ -2761,6 +2798,7 @@ function ScheduleView({
             onUpdate(id, updates);
             setDetailBook(null);
           }}
+          onAdd={onSubmit}
           onClose={() => setDetailBook(null)}
         />
       )}
@@ -3085,6 +3123,7 @@ function BookingDetailPopup({
   onCancel,
   onClose,
   onUpdate,
+  onAdd,
   isAdmin,
 }) {
   const inst = instruments.find((i) => i.id === b.instrument_id);
@@ -3095,58 +3134,63 @@ function BookingDetailPopup({
     ? bookings.filter((bk) => bk.group_id === b.group_id && !bk.cancelled)
     : null;
   const isGroup = groupRows && groupRows.length > 1;
-  const groupStart = isGroup
-    ? groupRows.slice().sort((a, z) => a.date.localeCompare(z.date))[0].date
-    : null;
-  const groupEnd = isGroup
-    ? groupRows.slice().sort((a, z) => z.date.localeCompare(a.date))[0].date
-    : null;
+  const sortedGroup = isGroup ? groupRows.slice().sort((a, z) => a.date.localeCompare(z.date)) : null;
+  const groupStart = isGroup ? sortedGroup[0].date : null;
+  const groupEnd   = isGroup ? sortedGroup[sortedGroup.length - 1].date : null;
   const canCancel = isMe || isAdmin;
 
   const [editing, setEditing] = useState(false);
-  const [editTime0, setTime0] = useState(b.start_time);
-  const [editTime1, setTime1] = useState(b.end_time);
+  const [editStartDate, setEditStartDate] = useState(isGroup ? groupStart : b.date);
+  const [editEndDate,   setEditEndDate]   = useState(isGroup ? groupEnd   : b.date);
+  const [editTime0, setTime0] = useState(isGroup ? sortedGroup?.[0].start_time : b.start_time);
+  const [editTime1, setTime1] = useState(isGroup ? sortedGroup?.[sortedGroup.length-1].end_time : b.end_time);
   const [editNote, setEditNote] = useState(b.note || '');
   const [saving, setSaving] = useState(false);
 
-  const editConflict =
-    editing &&
-    !isGroup &&
+  function getEditDates() {
+    const dates = [];
+    const d = new Date(editStartDate + 'T12:00:00');
+    const end = new Date(editEndDate + 'T12:00:00');
+    while (d <= end) { dates.push(d.toISOString().split('T')[0]); d.setDate(d.getDate() + 1); }
+    return dates;
+  }
+  const editDates = getEditDates();
+  const editIsMultiDay = editDates.length > 1;
+
+  const allGroupIds = (groupRows || [{ id: b.id }]).map(r => r.id);
+  const editConflict = editing && editDates.some((date) =>
     bookings.some((bk) => {
-      if (
-        bk.id === b.id ||
-        bk.instrument_id !== b.instrument_id ||
-        bk.date !== b.date ||
-        bk.cancelled
-      )
-        return false;
-      return !(editTime1 <= bk.start_time || editTime0 >= bk.end_time);
-    });
+      if (allGroupIds.includes(bk.id) || bk.instrument_id !== b.instrument_id || bk.date !== date || bk.cancelled) return false;
+      const s = date === editStartDate ? editTime0 : '00:00';
+      const e = date === editEndDate   ? editTime1 : '23:59';
+      return !(e <= bk.start_time || s >= bk.end_time);
+    })
+  );
 
   async function saveEdit() {
     if (editConflict || saving) return;
     setSaving(true);
-    if (isGroup) {
-      const sorted = groupRows
-        .slice()
-        .sort((a, z) => a.date.localeCompare(z.date));
-      for (let i = 0; i < sorted.length; i++) {
+    const datesChanged = editStartDate !== (isGroup ? groupStart : b.date) || editEndDate !== (isGroup ? groupEnd : b.date);
+    if (datesChanged && onAdd) {
+      // Cancel existing rows and re-insert with new date range
+      await onCancel(b.group_id || null, b.id);
+      const gid = editDates.length > 1 ? (b.group_id || genId()) : null;
+      for (const date of editDates) {
+        const s = date === editStartDate ? editTime0 : '00:00';
+        const e = date === editEndDate   ? editTime1 : '23:59';
+        await onAdd({ groupId: gid, instrumentId: b.instrument_id, user: b.user_display_name, date, startTime: s, endTime: e, note: editNote, recurring: null });
+      }
+    } else if (isGroup) {
+      for (let i = 0; i < sortedGroup.length; i++) {
         const s = i === 0 ? editTime0 : '00:00';
-        const e = i === sorted.length - 1 ? editTime1 : '23:59';
-        await onUpdate(sorted[i].id, {
-          start_time: s,
-          end_time: e,
-          note: editNote,
-        });
+        const e = i === sortedGroup.length - 1 ? editTime1 : '23:59';
+        await onUpdate(sortedGroup[i].id, { start_time: s, end_time: e, note: editNote });
       }
     } else {
-      await onUpdate(b.id, {
-        start_time: editTime0,
-        end_time: editTime1,
-        note: editNote,
-      });
+      await onUpdate(b.id, { start_time: editTime0, end_time: editTime1, note: editNote });
     }
     setSaving(false);
+    onClose();
   }
 
   return (
@@ -3293,85 +3337,53 @@ function BookingDetailPopup({
                 gap: 10,
               }}
             >
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: '1fr 1fr',
-                  gap: 10,
-                }}
-              >
+              {/* Date pickers */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                 <div>
-                  <div
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      color: '#475569',
-                      marginBottom: 4,
-                    }}
-                  >
-                    {isGroup ? 'START (day 1)' : 'START'}
-                  </div>
-                  <input
-                    type="time"
-                    value={editTime0}
-                    onChange={(e) => setTime0(e.target.value)}
-                    style={{ ...S.input, fontSize: 13 }}
-                  />
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>START DATE</div>
+                  <input type="date" value={editStartDate}
+                    onChange={(e) => { setEditStartDate(e.target.value); if (e.target.value > editEndDate) setEditEndDate(e.target.value); }}
+                    style={{ ...S.input, fontSize: 13 }} />
                 </div>
                 <div>
-                  <div
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      color: '#475569',
-                      marginBottom: 4,
-                    }}
-                  >
-                    {isGroup ? 'END (last day)' : 'END'}
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>END DATE</div>
+                  <input type="date" value={editEndDate} min={editStartDate}
+                    onChange={(e) => setEditEndDate(e.target.value)}
+                    style={{ ...S.input, fontSize: 13 }} />
+                </div>
+              </div>
+              {editIsMultiDay && (
+                <div style={{ ...S.chip, color: '#4ADE80', background: '#4ADE8018', justifyContent: 'center' }}>
+                  📅 {editDates.length}-day booking
+                </div>
+              )}
+              {/* Time pickers */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
+                    {editIsMultiDay ? 'START TIME (day 1)' : 'START'}
                   </div>
-                  <input
-                    type="time"
-                    value={editTime1}
-                    onChange={(e) => setTime1(e.target.value)}
-                    style={{ ...S.input, fontSize: 13 }}
-                  />
+                  <input type="time" value={editTime0} onChange={(e) => setTime0(e.target.value)} style={{ ...S.input, fontSize: 13 }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
+                    {editIsMultiDay ? 'END TIME (last day)' : 'END'}
+                  </div>
+                  <input type="time" value={editTime1} onChange={(e) => setTime1(e.target.value)} style={{ ...S.input, fontSize: 13 }} />
                 </div>
               </div>
               <div>
-                <div
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 700,
-                    color: '#475569',
-                    marginBottom: 4,
-                  }}
-                >
-                  NOTE
-                </div>
-                <input
-                  value={editNote}
-                  onChange={(e) => setEditNote(e.target.value)}
-                  placeholder="Add a note…"
-                  maxLength={200}
-                  style={{ ...S.input, fontSize: 13 }}
-                />
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>NOTE</div>
+                <input value={editNote} onChange={(e) => setEditNote(e.target.value)}
+                  placeholder="Add a note…" maxLength={200} style={{ ...S.input, fontSize: 13 }} />
               </div>
-              {editConflict && (
-                <div style={S.conflictBanner}>
-                  ⚠ Time conflicts with another booking
-                </div>
-              )}
+              {editConflict && <div style={S.conflictBanner}>⚠ Time conflicts with another booking</div>}
               <button
                 onClick={saveEdit}
                 disabled={editConflict || saving}
-                style={{
-                  ...S.submitBtn,
-                  width: '100%',
-                  background: editConflict ? '#1E293B' : inst?.color,
-                  color: editConflict ? '#475569' : '#000',
-                }}
+                style={{ ...S.submitBtn, width: '100%', background: editConflict ? '#1E293B' : inst?.color, color: editConflict ? '#475569' : '#000' }}
               >
-                {saving ? 'Saving…' : 'Save changes'}
+                {saving ? 'Saving…' : editIsMultiDay ? `Save ${editDates.length}-day booking` : 'Save changes'}
               </button>
             </div>
           )}
