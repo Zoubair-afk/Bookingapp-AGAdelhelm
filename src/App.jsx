@@ -5694,6 +5694,9 @@ function makeS(t) {
       borderTop: '1px solid ' + t.border,
       display: 'flex',
       paddingBottom: 20,
+      backdropFilter: 'blur(12px)',
+      WebkitBackdropFilter: 'blur(12px)',
+      zIndex: 50,
     },
     navBtn: {
       flex: 1,
@@ -5850,8 +5853,10 @@ function makeCss(t) {
       t.textLow +
       ';letter-spacing:0.2px;}',
     '#root{width:100%;height:100%;}',
-    '*{box-sizing:border-box;margin:0;padding:0;}',
+    '*{box-sizing:border-box;margin:0;padding:0;-webkit-user-select:none;user-select:none;}',
     '::-webkit-scrollbar{display:none;}',
+    'input,textarea,select{user-select:text;-webkit-user-select:text;}',
+    'input,textarea{-webkit-user-select:auto;}',
     '.noScroll{scrollbar-width:none;}',
     ".mono{font-family:'IBM Plex Mono',monospace;}",
     '.view{padding-bottom:100px;}',
