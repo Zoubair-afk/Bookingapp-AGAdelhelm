@@ -151,6 +151,43 @@ function fmtDate(
 ) {
   return new Date(d + 'T12:00:00').toLocaleDateString('en-US', opts);
 }
+// ─── Booking rules engine ────────────────────────────────────────────────────
+function parseRules(instrument) {
+  try {
+    if (!instrument?.rules) return [];
+    return JSON.parse(instrument.rules);
+  } catch { return []; }
+}
+function isWeekend(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00');
+  return d.getDay() === 5 || d.getDay() === 6 || d.getDay() === 0; // Fri, Sat, Sun
+}
+function checkRules(instrument, dates, startTime, endTime) {
+  const rules = parseRules(instrument);
+  if (!rules.length) return null;
+  let totalMins = 0;
+  for (let i = 0; i < dates.length; i++) {
+    const s = i === 0 ? startTime : '00:00';
+    const e = i === dates.length - 1 ? endTime : '23:59';
+    totalMins += toMins(e) - toMins(s);
+  }
+  const allWeekend = dates.every(isWeekend);
+  for (const rule of rules) {
+    if (rule.maxHours != null) {
+      const limitMins = rule.maxHours * 60;
+      if (totalMins > limitMins + 1) { // +1 min tolerance for rounding
+        if (rule.bypassOnWeekend && allWeekend) continue;
+        const bypass = rule.bypassOnWeekend ? ' (weekend bookings exempt)' : '';
+        return `Max ${rule.maxHours}h allowed for ${instrument.name}${bypass}`;
+      }
+    }
+    if (rule.weekendOnly && !allWeekend) {
+      return `${instrument.name} can only be booked on weekends`;
+    }
+  }
+  return null;
+}
+
 async function hashPw(pw) {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -467,6 +504,12 @@ export default function App() {
           'Slot just got booked by someone else — please pick another time',
           'error'
         );
+        return;
+      }
+      const ruleInst = instruments.find((i) => i.id === b.instrumentId);
+      const ruleError = checkRules(ruleInst, [b.date], b.startTime, b.endTime);
+      if (ruleError) {
+        showToast(ruleError, 'error');
         return;
       }
       const [nb] = await db.insert({
@@ -1467,6 +1510,7 @@ function NewBookingView({
     : false;
 
   const invalid = (!multiDay && dur <= 0) || !instrument || endDate < startDate;
+  const ruleError = instrument ? checkRules(instrument, dates, startTime, endTime) : null;
 
   function suggestSlot() {
     if (!instrument) return;
@@ -1489,7 +1533,7 @@ function NewBookingView({
   }
 
   async function submit() {
-    if (invalid || conflict || submitting) return;
+    if (invalid || conflict || ruleError || submitting) return;
     // Check booking day limit
     const maxDays = instrument?.max_days ?? null;
     if (maxDays && dates.length > maxDays) {
@@ -1751,6 +1795,39 @@ function NewBookingView({
             ⚠ Slot conflict — another booking overlaps this time
           </div>
         )}
+        {ruleError && !conflict && (
+          <div style={{ ...S.conflictBanner, borderColor: '#FB923C55', background: '#FB923C15', color: '#FB923C', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+            <span>⚠ {ruleError}</span>
+            {(() => {
+              const rules = parseRules(instrument);
+              let totalMins = 0;
+              for (let i = 0; i < dates.length; i++) {
+                const s = i === 0 ? startTime : '00:00';
+                const e = i === dates.length - 1 ? endTime : '23:59';
+                totalMins += toMins(e) - toMins(s);
+              }
+              const violatedRule = rules.find(r => r.maxHours != null && totalMins > r.maxHours * 60);
+              if (!violatedRule) return null;
+              return (
+                <button
+                  onClick={() => {
+                    const limitMins = violatedRule.maxHours * 60;
+                    const totalMinsFromMidnight = toMins(startTime) + limitMins;
+                    const extraDays = Math.floor(totalMinsFromMidnight / 1440);
+                    const endMinsOfDay = Math.floor((totalMinsFromMidnight % 1440) / 15) * 15;
+                    const d = new Date(startDate + 'T12:00:00');
+                    d.setDate(d.getDate() + extraDays);
+                    setEndDate(d.toISOString().split('T')[0]);
+                    setEnd(minsToTime(Math.min(endMinsOfDay, 1439)));
+                  }}
+                  style={{ background: '#FB923C33', border: '1px solid #FB923C66', color: '#FB923C', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', fontSize: 10, fontWeight: 700, fontFamily: 'inherit', whiteSpace: 'nowrap', flexShrink: 0 }}
+                >
+                  Adjust
+                </button>
+              );
+            })()}
+          </div>
+        )}
         {instrument?.max_days && (
           <div
             style={{
@@ -1768,12 +1845,12 @@ function NewBookingView({
 
         <button
           onClick={submit}
-          disabled={invalid || conflict || submitting}
+          disabled={invalid || conflict || !!ruleError || submitting}
           style={{
             ...S.submitBtn,
             background:
-              invalid || conflict ? '#1E293B' : instrument?.color ?? '#38BDF8',
-            color: invalid || conflict ? '#475569' : '#000',
+              invalid || conflict || ruleError ? '#1E293B' : instrument?.color ?? '#38BDF8',
+            color: invalid || conflict || ruleError ? '#475569' : '#000',
           }}
         >
           {submitting ? (
@@ -1866,8 +1943,6 @@ function ScheduleView({
   const [calMonth, setCalMonth] = useState(NOW.getMonth());
   const [quickBook, setQuickBook] = useState(null);
   const [detailBook, setDetailBook] = useState(null);
-  const [monthDragStart, setMonthDragStart] = useState(null); // date string while dragging in month view
-  const [monthDragEnd, setMonthDragEnd] = useState(null);
 
   // Drag state — stored in refs to avoid re-render storms during move
   const dragStartDate = useRef(null);
@@ -1982,7 +2057,14 @@ function ScheduleView({
     return minsA < minsB ? -1 : minsA > minsB ? 1 : 0;
   }
 
+  // Touch-specific refs for long-press-to-book on mobile
+  const longPressTimer = useRef(null);
+  const touchBookingMode = useRef(false);
+  const touchBookingEl = useRef(null);
+
+  // ── Mouse/desktop: plain pointer drag ─────────────────────────────────────
   function onPointerDown(e, date, el) {
+    if (e.pointerType === 'touch') return; // touch handled separately
     if (e.target.closest('[data-booking]')) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     const mins = getMins(e.clientY, el);
@@ -1994,8 +2076,8 @@ function ScheduleView({
     dragActivated.current = false;
     setDragVis(null);
   }
-
   function onPointerMove(e, date, el) {
+    if (e.pointerType === 'touch') return;
     if (!dragStartDate.current) return;
     if (!dragActivated.current) {
       if (Math.abs(e.clientY - dragStartY.current) < DRAG_PX) return;
@@ -2004,44 +2086,73 @@ function ScheduleView({
     const mins = getMins(e.clientY, el);
     dragEndDate.current = date;
     dragEndMins.current = mins;
-    let [sd, sm, ed, em] = [
-      dragStartDate.current,
-      dragStartMins.current,
-      dragEndDate.current,
-      dragEndMins.current,
-    ];
-    if (cmpPos(sd, sm, ed, em) > 0) {
-      [sd, sm, ed, em] = [ed, em, sd, sm];
-    }
-    setDragVis({
-      startDate: sd,
-      startMins: sm,
-      endDate: ed,
-      endMins: Math.max(sm + 15, em),
-    });
+    let [sd, sm, ed, em] = [dragStartDate.current, dragStartMins.current, dragEndDate.current, dragEndMins.current];
+    if (cmpPos(sd, sm, ed, em) > 0) [sd, sm, ed, em] = [ed, em, sd, sm];
+    setDragVis({ startDate: sd, startMins: sm, endDate: ed, endMins: Math.max(sm + 15, em) });
   }
-
-  function onPointerUp() {
+  function onPointerUp(e) {
+    if (e && e.pointerType === 'touch') return;
     if (!dragStartDate.current) return;
     const activated = dragActivated.current;
     dragActivated.current = false;
-    if (!activated) {
-      dragStartDate.current = null;
+    if (!activated) { dragStartDate.current = null; return; }
+    let [sd, sm, ed, em] = [dragStartDate.current, dragStartMins.current, dragEndDate.current, dragEndMins.current];
+    if (cmpPos(sd, sm, ed, em) > 0) [sd, sm, ed, em] = [ed, em, sd, sm];
+    dragStartDate.current = null; setDragVis(null);
+    setQuickBook({ startDate: sd, startMins: sm, endDate: ed, endMins: Math.max(sm + 15, em) });
+  }
+
+  // ── Touch/mobile: long-press (350ms) activates booking mode, then drag ────
+  function onTouchStart(e, date, el) {
+    if (e.target.closest('[data-booking]')) return;
+    const touch = e.touches[0];
+    const mins = getMins(touch.clientY, el);
+    dragStartY.current = touch.clientY;
+    touchBookingMode.current = false;
+    clearTimeout(longPressTimer.current);
+    const capturedEl = el; // capture el for use inside timer closure
+    longPressTimer.current = setTimeout(() => {
+      touchBookingMode.current = true;
+      touchBookingEl.current = capturedEl; // store so onTouchMove can use it
+      try { navigator.vibrate?.(30); } catch {}
+      dragStartDate.current = date;
+      dragStartMins.current = mins;
+      dragEndDate.current = date;
+      dragEndMins.current = mins + 60;
+      dragActivated.current = true;
+      setDragVis({ startDate: date, startMins: mins, endDate: date, endMins: mins + 60 });
+    }, 350);
+  }
+  function onTouchMove(e, date, el) {
+    const touch = e.touches[0];
+    if (!touchBookingMode.current) {
+      if (Math.abs(touch.clientY - dragStartY.current) > 6) clearTimeout(longPressTimer.current);
       return;
     }
-    let [sd, sm, ed, em] = [
-      dragStartDate.current,
-      dragStartMins.current,
-      dragEndDate.current,
-      dragEndMins.current,
-    ];
-    if (cmpPos(sd, sm, ed, em) > 0) {
-      [sd, sm, ed, em] = [ed, em, sd, sm];
-    }
-    em = Math.max(sm + 15, em);
-    dragStartDate.current = null;
-    setDragVis(null);
-    setQuickBook({ startDate: sd, startMins: sm, endDate: ed, endMins: em });
+    e.preventDefault();
+    // Use the stored column el (finger may have drifted outside original column)
+    const activeEl = touchBookingEl.current || el;
+    const mins = getMins(touch.clientY, activeEl);
+    dragEndDate.current = date;
+    dragEndMins.current = mins;
+    let sd = dragStartDate.current;
+    let sm = dragStartMins.current;
+    let ed = dragEndDate.current;
+    let em = dragEndMins.current;
+    if (cmpPos(sd, sm, ed, em) > 0) { [sd, sm, ed, em] = [ed, em, sd, sm]; }
+    // Force a re-render with new state
+    setDragVis({ startDate: sd, startMins: sm, endDate: ed, endMins: Math.max(sm + 15, em) });
+  }
+  function onTouchEnd() {
+    clearTimeout(longPressTimer.current);
+    if (!touchBookingMode.current) return;
+    touchBookingMode.current = false;
+    touchBookingEl.current = null;
+    if (!dragStartDate.current) return;
+    let [sd, sm, ed, em] = [dragStartDate.current, dragStartMins.current, dragEndDate.current, dragEndMins.current];
+    if (cmpPos(sd, sm, ed, em) > 0) [sd, sm, ed, em] = [ed, em, sd, sm];
+    dragStartDate.current = null; dragActivated.current = false; setDragVis(null);
+    setQuickBook({ startDate: sd, startMins: sm, endDate: ed, endMins: Math.max(sm + 15, em) });
   }
 
   // ── Booking block (absolutely positioned, with overlap columns) ──────────
@@ -2143,8 +2254,39 @@ function ScheduleView({
       scrollRef.current.scrollTop = (currentHour - 2) * HOUR_H;
     }
   }, []);
+  // Stable refs so touch handlers always call latest version
+  const onTouchStartRef = useRef(null);
+  const onTouchMoveRef  = useRef(null);
+  const onTouchEndRef   = useRef(null);
+  onTouchStartRef.current = onTouchStart;
+  onTouchMoveRef.current  = onTouchMove;
+  onTouchEndRef.current   = onTouchEnd;
+
   function TimeColumn({ date, bkgs }) {
     const colRef = useRef(null);
+    useEffect(() => {
+      const el = colRef.current;
+      if (!el) return;
+      const ts = (e) => onTouchStartRef.current(e, date, el);
+      const tm = (e) => onTouchMoveRef.current(e, date, el);
+      const te = ()  => onTouchEndRef.current();
+      const tc = ()  => {
+        clearTimeout(longPressTimer.current);
+        touchBookingMode.current = false;
+        dragStartDate.current = null;
+        setDragVis(null);
+      };
+      el.addEventListener('touchstart',  ts, { passive: true });
+      el.addEventListener('touchmove',   tm, { passive: false });
+      el.addEventListener('touchend',    te, { passive: true });
+      el.addEventListener('touchcancel', tc, { passive: true });
+      return () => {
+        el.removeEventListener('touchstart',  ts);
+        el.removeEventListener('touchmove',   tm);
+        el.removeEventListener('touchend',    te);
+        el.removeEventListener('touchcancel', tc);
+      };
+    }, [date]);
     // Compute drag overlay for this column
     let dragOverlay = null;
     if (dragVis) {
@@ -2241,17 +2383,15 @@ function ScheduleView({
         style={{
           position: 'relative',
           height: HOUR_H * 24,
-          touchAction: 'none',
+          touchAction: 'pan-y',
           userSelect: 'none',
+          WebkitUserSelect: 'none',
+          WebkitTouchCallout: 'none',
         }}
         onPointerDown={(e) => onPointerDown(e, date, colRef.current)}
         onPointerMove={(e) => onPointerMove(e, date, colRef.current)}
-        onPointerUp={onPointerUp}
-        onPointerCancel={() => {
-          dragStartDate.current = null;
-          dragActivated.current = false;
-          setDragVis(null);
-        }}
+        onPointerUp={(e) => onPointerUp(e)}
+        onPointerCancel={() => { dragStartDate.current = null; dragActivated.current = false; setDragVis(null); }}
       >
         {/* Hour lines */}
         {HOURS.map((h) => (
@@ -2514,43 +2654,14 @@ function ScheduleView({
               const isToday = ds === todayStr;
               const isSel = ds === selectedDate;
               const hasB = hasBookings(ds);
-              // Determine if this day is inside the current month-drag selection
-              const dragMin = monthDragStart && monthDragEnd
-                ? (monthDragStart <= monthDragEnd ? monthDragStart : monthDragEnd)
-                : null;
-              const dragMax = monthDragStart && monthDragEnd
-                ? (monthDragStart <= monthDragEnd ? monthDragEnd : monthDragStart)
-                : null;
-              const inDrag = dragMin && ds >= dragMin && ds <= dragMax;
-              const isDragStart = dragMin && ds === dragMin;
-              const isDragEnd = dragMax && ds === dragMax;
               return (
-                <div
+                <button
                   key={day}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    setMonthDragStart(ds);
-                    setMonthDragEnd(ds);
-                  }}
-                  onMouseEnter={() => {
-                    if (monthDragStart) setMonthDragEnd(ds);
-                  }}
-                  onMouseUp={() => {
-                    if (monthDragStart) {
-                      const sd = monthDragStart <= ds ? monthDragStart : ds;
-                      const ed = monthDragStart <= ds ? ds : monthDragStart;
-                      setMonthDragStart(null);
-                      setMonthDragEnd(null);
-                      if (sd === ed) {
-                        selectDay(sd); // single tap → go to day view
-                      } else {
-                        setQuickBook({ startDate: sd, startMins: 0, endDate: ed, endMins: 1440 });
-                      }
-                    }
-                  }}
+                  onClick={() => selectDay(ds)}
                   style={{
                     aspectRatio: '1',
                     borderRadius: 8,
+                    border: 'none',
                     cursor: 'pointer',
                     display: 'flex',
                     flexDirection: 'column',
@@ -2559,17 +2670,12 @@ function ScheduleView({
                     position: 'relative',
                     fontSize: 13,
                     fontWeight: isToday || isSel ? 800 : 400,
-                    userSelect: 'none',
-                    background: inDrag
-                      ? themeColor + '44'
-                      : isSel
+                    background: isSel
                       ? themeColor
                       : isToday
                       ? themeColor + '33'
                       : 'transparent',
-                    color: isSel ? '#000' : inDrag ? themeColor : isToday ? themeColor : t.textMid,
-                    outline: (isDragStart || isDragEnd) ? `2px solid ${themeColor}` : 'none',
-                    outlineOffset: -2,
+                    color: isSel ? '#000' : isToday ? themeColor : t.textMid,
                   }}
                 >
                   {day}
@@ -2579,26 +2685,25 @@ function ScheduleView({
                         width: 4,
                         height: 4,
                         borderRadius: '50%',
-                        background: inDrag || isSel ? '#000' : themeColor,
+                        background: isSel ? '#000' : themeColor,
                         position: 'absolute',
                         bottom: 3,
                       }}
                     />
                   )}
-                </div>
+                </button>
               );
             })}
           </div>
-          {/* Cancel month drag if mouse released outside */}
           <div
-            style={{ fontSize: 10, color: t.textLow, textAlign: 'center', marginTop: 10 }}
-            onMouseLeave={() => { if (monthDragStart) { setMonthDragStart(null); setMonthDragEnd(null); } }}
+            style={{
+              fontSize: 10,
+              color: t.textLow,
+              textAlign: 'center',
+              marginTop: 10,
+            }}
           >
-            {monthDragStart && monthDragEnd && monthDragStart !== monthDragEnd
-              ? `Book ${Math.abs(
-                  (new Date(monthDragEnd) - new Date(monthDragStart)) / 86400000
-                ) + 1} days`
-              : 'Tap a day · drag to book a range'}
+            Tap a day to see its schedule
           </div>
         </div>
       )}
@@ -2798,7 +2903,6 @@ function ScheduleView({
             onUpdate(id, updates);
             setDetailBook(null);
           }}
-          onAdd={onSubmit}
           onClose={() => setDetailBook(null)}
         />
       )}
@@ -2816,10 +2920,12 @@ function QuickBookPopup({
   onConfirm,
   onClose,
 }) {
-  const multiDay = dragInfo.startDate !== dragInfo.endDate;
   const [instrumentId, setInstrId] = useState(
     filterInst !== 'all' ? filterInst : instruments[0]?.id
   );
+  const [startDate, setStartDate] = useState(dragInfo.startDate);
+  const [endDate, setEndDate] = useState(dragInfo.endDate);
+  const multiDay = startDate !== endDate;
   const [startTime, setStart] = useState(minsToTime(dragInfo.startMins));
   const [endTime, setEnd] = useState(minsToTime(dragInfo.endMins));
   const [note, setNote] = useState('');
@@ -2836,15 +2942,15 @@ function QuickBookPopup({
     }
     return dates;
   }
-  const dates = dateRange(dragInfo.startDate, dragInfo.endDate);
+  const dates = dateRange(startDate, endDate);
 
   const conflict = inst
     ? dates.some((date) =>
         bookings.some((b) => {
           if (b.instrument_id !== inst.id || b.date !== date || b.cancelled)
             return false;
-          const s = date === dragInfo.startDate ? startTime : '00:00';
-          const e = date === dragInfo.endDate ? endTime : '23:59';
+          const s = date === startDate ? startTime : '00:00';
+          const e = date === endDate ? endTime : '23:59';
           return !(toMins(e) <= toMins(b.start_time) || toMins(s) >= toMins(b.end_time));
         })
       )
@@ -2852,14 +2958,15 @@ function QuickBookPopup({
 
   const maxDays = inst?.max_days ?? null;
   const overLimit = maxDays !== null && dates.length > maxDays;
+  const ruleError = inst ? checkRules(inst, dates, startTime, endTime) : null;
 
   async function confirm() {
-    if (conflict || overLimit || saving || !inst) return;
+    if (conflict || overLimit || ruleError || saving || !inst) return;
     setSaving(true);
     const gid = dates.length > 1 ? genId() : null;
     for (const date of dates) {
-      const s = date === dragInfo.startDate ? startTime : '00:00';
-      const e = date === dragInfo.endDate ? endTime : '23:59';
+      const s = date === startDate ? startTime : '00:00';
+      const e = date === endDate ? endTime : '23:59';
       await onConfirm({
         groupId: gid,
         instrumentId: inst.id,
@@ -2910,14 +3017,14 @@ function QuickBookPopup({
             <div style={{ fontSize: 15, fontWeight: 800 }}>Quick Book</div>
             <div style={{ fontSize: 11, color: '#64748B' }}>
               {multiDay
-                ? `${fmtDate(dragInfo.startDate, {
+                ? `${fmtDate(startDate, {
                     month: 'short',
                     day: 'numeric',
-                  })} → ${fmtDate(dragInfo.endDate, {
+                  })} → ${fmtDate(endDate, {
                     month: 'short',
                     day: 'numeric',
                   })} (${dates.length} days)`
-                : fmtDate(dragInfo.startDate, {
+                : fmtDate(startDate, {
                     weekday: 'short',
                     month: 'short',
                     day: 'numeric',
@@ -3079,16 +3186,44 @@ function QuickBookPopup({
             ⚠ Max {maxDays} day{maxDays > 1 ? 's' : ''} allowed for {inst?.name}
           </div>
         )}
+        {ruleError && !overLimit && (
+          <div style={{ ...S.conflictBanner, marginBottom: 12, borderColor: '#FB923C55', background: '#FB923C15', color: '#FB923C', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+            <span>⚠ {ruleError}</span>
+            {(() => {
+              const rules = parseRules(inst);
+              let totalMins = 0;
+              for (let i = 0; i < dates.length; i++) {
+                const s = i === 0 ? startTime : '00:00';
+                const e = i === dates.length - 1 ? endTime : '23:59';
+                totalMins += toMins(e) - toMins(s);
+              }
+              const violatedRule = rules.find(r => r.maxHours != null && totalMins > r.maxHours * 60);
+              if (!violatedRule) return null;
+              return (
+                <button
+                  onClick={() => {
+                    const rawMins = toMins(startTime) + violatedRule.maxHours * 60;
+                    const snapped = Math.floor(rawMins / 15) * 15;
+                    setEnd(minsToTime(Math.min(snapped, 1439)));
+                  }}
+                  style={{ background: '#FB923C33', border: '1px solid #FB923C66', color: '#FB923C', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', fontSize: 10, fontWeight: 700, fontFamily: 'inherit', whiteSpace: 'nowrap', flexShrink: 0 }}
+                >
+                  Adjust
+                </button>
+              );
+            })()}
+          </div>
+        )}
 
         <button
           onClick={confirm}
-          disabled={conflict || overLimit || saving}
+          disabled={conflict || overLimit || !!ruleError || saving}
           style={{
             ...S.submitBtn,
             width: '100%',
             background:
-              conflict || overLimit ? '#1E293B' : inst?.color ?? '#38BDF8',
-            color: conflict || overLimit ? '#475569' : '#000',
+              conflict || overLimit || ruleError ? '#1E293B' : inst?.color ?? '#38BDF8',
+            color: conflict || overLimit || ruleError ? '#475569' : '#000',
           }}
         >
           {saving ? (
@@ -3123,7 +3258,6 @@ function BookingDetailPopup({
   onCancel,
   onClose,
   onUpdate,
-  onAdd,
   isAdmin,
 }) {
   const inst = instruments.find((i) => i.id === b.instrument_id);
@@ -3134,63 +3268,58 @@ function BookingDetailPopup({
     ? bookings.filter((bk) => bk.group_id === b.group_id && !bk.cancelled)
     : null;
   const isGroup = groupRows && groupRows.length > 1;
-  const sortedGroup = isGroup ? groupRows.slice().sort((a, z) => a.date.localeCompare(z.date)) : null;
-  const groupStart = isGroup ? sortedGroup[0].date : null;
-  const groupEnd   = isGroup ? sortedGroup[sortedGroup.length - 1].date : null;
+  const groupStart = isGroup
+    ? groupRows.slice().sort((a, z) => a.date.localeCompare(z.date))[0].date
+    : null;
+  const groupEnd = isGroup
+    ? groupRows.slice().sort((a, z) => z.date.localeCompare(a.date))[0].date
+    : null;
   const canCancel = isMe || isAdmin;
 
   const [editing, setEditing] = useState(false);
-  const [editStartDate, setEditStartDate] = useState(isGroup ? groupStart : b.date);
-  const [editEndDate,   setEditEndDate]   = useState(isGroup ? groupEnd   : b.date);
-  const [editTime0, setTime0] = useState(isGroup ? sortedGroup?.[0].start_time : b.start_time);
-  const [editTime1, setTime1] = useState(isGroup ? sortedGroup?.[sortedGroup.length-1].end_time : b.end_time);
+  const [editTime0, setTime0] = useState(b.start_time);
+  const [editTime1, setTime1] = useState(b.end_time);
   const [editNote, setEditNote] = useState(b.note || '');
   const [saving, setSaving] = useState(false);
 
-  function getEditDates() {
-    const dates = [];
-    const d = new Date(editStartDate + 'T12:00:00');
-    const end = new Date(editEndDate + 'T12:00:00');
-    while (d <= end) { dates.push(d.toISOString().split('T')[0]); d.setDate(d.getDate() + 1); }
-    return dates;
-  }
-  const editDates = getEditDates();
-  const editIsMultiDay = editDates.length > 1;
-
-  const allGroupIds = (groupRows || [{ id: b.id }]).map(r => r.id);
-  const editConflict = editing && editDates.some((date) =>
+  const editConflict =
+    editing &&
+    !isGroup &&
     bookings.some((bk) => {
-      if (allGroupIds.includes(bk.id) || bk.instrument_id !== b.instrument_id || bk.date !== date || bk.cancelled) return false;
-      const s = date === editStartDate ? editTime0 : '00:00';
-      const e = date === editEndDate   ? editTime1 : '23:59';
-      return !(e <= bk.start_time || s >= bk.end_time);
-    })
-  );
+      if (
+        bk.id === b.id ||
+        bk.instrument_id !== b.instrument_id ||
+        bk.date !== b.date ||
+        bk.cancelled
+      )
+        return false;
+      return !(editTime1 <= bk.start_time || editTime0 >= bk.end_time);
+    });
 
   async function saveEdit() {
     if (editConflict || saving) return;
     setSaving(true);
-    const datesChanged = editStartDate !== (isGroup ? groupStart : b.date) || editEndDate !== (isGroup ? groupEnd : b.date);
-    if (datesChanged && onAdd) {
-      // Cancel existing rows and re-insert with new date range
-      await onCancel(b.group_id || null, b.id);
-      const gid = editDates.length > 1 ? (b.group_id || genId()) : null;
-      for (const date of editDates) {
-        const s = date === editStartDate ? editTime0 : '00:00';
-        const e = date === editEndDate   ? editTime1 : '23:59';
-        await onAdd({ groupId: gid, instrumentId: b.instrument_id, user: b.user_display_name, date, startTime: s, endTime: e, note: editNote, recurring: null });
-      }
-    } else if (isGroup) {
-      for (let i = 0; i < sortedGroup.length; i++) {
+    if (isGroup) {
+      const sorted = groupRows
+        .slice()
+        .sort((a, z) => a.date.localeCompare(z.date));
+      for (let i = 0; i < sorted.length; i++) {
         const s = i === 0 ? editTime0 : '00:00';
-        const e = i === sortedGroup.length - 1 ? editTime1 : '23:59';
-        await onUpdate(sortedGroup[i].id, { start_time: s, end_time: e, note: editNote });
+        const e = i === sorted.length - 1 ? editTime1 : '23:59';
+        await onUpdate(sorted[i].id, {
+          start_time: s,
+          end_time: e,
+          note: editNote,
+        });
       }
     } else {
-      await onUpdate(b.id, { start_time: editTime0, end_time: editTime1, note: editNote });
+      await onUpdate(b.id, {
+        start_time: editTime0,
+        end_time: editTime1,
+        note: editNote,
+      });
     }
     setSaving(false);
-    onClose();
   }
 
   return (
@@ -3337,53 +3466,85 @@ function BookingDetailPopup({
                 gap: 10,
               }}
             >
-              {/* Date pickers */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr',
+                  gap: 10,
+                }}
+              >
                 <div>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>START DATE</div>
-                  <input type="date" value={editStartDate}
-                    onChange={(e) => { setEditStartDate(e.target.value); if (e.target.value > editEndDate) setEditEndDate(e.target.value); }}
-                    style={{ ...S.input, fontSize: 13 }} />
-                </div>
-                <div>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>END DATE</div>
-                  <input type="date" value={editEndDate} min={editStartDate}
-                    onChange={(e) => setEditEndDate(e.target.value)}
-                    style={{ ...S.input, fontSize: 13 }} />
-                </div>
-              </div>
-              {editIsMultiDay && (
-                <div style={{ ...S.chip, color: '#4ADE80', background: '#4ADE8018', justifyContent: 'center' }}>
-                  📅 {editDates.length}-day booking
-                </div>
-              )}
-              {/* Time pickers */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                <div>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
-                    {editIsMultiDay ? 'START TIME (day 1)' : 'START'}
+                  <div
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: '#475569',
+                      marginBottom: 4,
+                    }}
+                  >
+                    {isGroup ? 'START (day 1)' : 'START'}
                   </div>
-                  <input type="time" value={editTime0} onChange={(e) => setTime0(e.target.value)} style={{ ...S.input, fontSize: 13 }} />
+                  <input
+                    type="time"
+                    value={editTime0}
+                    onChange={(e) => setTime0(e.target.value)}
+                    style={{ ...S.input, fontSize: 13 }}
+                  />
                 </div>
                 <div>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
-                    {editIsMultiDay ? 'END TIME (last day)' : 'END'}
+                  <div
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: '#475569',
+                      marginBottom: 4,
+                    }}
+                  >
+                    {isGroup ? 'END (last day)' : 'END'}
                   </div>
-                  <input type="time" value={editTime1} onChange={(e) => setTime1(e.target.value)} style={{ ...S.input, fontSize: 13 }} />
+                  <input
+                    type="time"
+                    value={editTime1}
+                    onChange={(e) => setTime1(e.target.value)}
+                    style={{ ...S.input, fontSize: 13 }}
+                  />
                 </div>
               </div>
               <div>
-                <div style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>NOTE</div>
-                <input value={editNote} onChange={(e) => setEditNote(e.target.value)}
-                  placeholder="Add a note…" maxLength={200} style={{ ...S.input, fontSize: 13 }} />
+                <div
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: '#475569',
+                    marginBottom: 4,
+                  }}
+                >
+                  NOTE
+                </div>
+                <input
+                  value={editNote}
+                  onChange={(e) => setEditNote(e.target.value)}
+                  placeholder="Add a note…"
+                  maxLength={200}
+                  style={{ ...S.input, fontSize: 13 }}
+                />
               </div>
-              {editConflict && <div style={S.conflictBanner}>⚠ Time conflicts with another booking</div>}
+              {editConflict && (
+                <div style={S.conflictBanner}>
+                  ⚠ Time conflicts with another booking
+                </div>
+              )}
               <button
                 onClick={saveEdit}
                 disabled={editConflict || saving}
-                style={{ ...S.submitBtn, width: '100%', background: editConflict ? '#1E293B' : inst?.color, color: editConflict ? '#475569' : '#000' }}
+                style={{
+                  ...S.submitBtn,
+                  width: '100%',
+                  background: editConflict ? '#1E293B' : inst?.color,
+                  color: editConflict ? '#475569' : '#000',
+                }}
               >
-                {saving ? 'Saving…' : editIsMultiDay ? `Save ${editDates.length}-day booking` : 'Save changes'}
+                {saving ? 'Saving…' : 'Save changes'}
               </button>
             </div>
           )}
@@ -3941,6 +4102,7 @@ function AdminView({
   const [editIcon, setEditIcon] = useState('');
   const [editColor, setEditColor] = useState('');
   const [editMaxDays, setEditMaxDays] = useState('');
+  const [editRules, setEditRules] = useState([]);
   const [showEditIconPicker, setShowEditIconPicker] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmCancelBooking, setConfirmCancelBooking] = useState(null);
@@ -3954,6 +4116,7 @@ function AdminView({
     setEditIcon(inst.icon);
     setEditColor(inst.color);
     setEditMaxDays(inst.max_days ?? null);
+    setEditRules(parseRules(inst));
     setShowEditIconPicker(false);
   }
   function submitEdit() {
@@ -3965,6 +4128,7 @@ function AdminView({
       icon: editIcon,
       color: editColor,
       max_days: editMaxDays ? Number(editMaxDays) : null,
+      rules: editRules.length ? JSON.stringify(editRules) : null,
     });
     setEditingId(null);
   }
@@ -4351,6 +4515,61 @@ function AdminView({
                       style={{ ...S.input, width: 120 }}
                       className="inp"
                     />
+                  </div>
+                  <div>
+                    <FieldLabel>BOOKING RULES</FieldLabel>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {editRules.map((rule, rIdx) => (
+                        <div key={rIdx} style={{ background: t.bg0, border: '1px solid ' + t.border, borderRadius: 10, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: t.textLow }}>Rule {rIdx + 1}</span>
+                            <button
+                              onClick={() => setEditRules(editRules.filter((_, i) => i !== rIdx))}
+                              style={{ background: '#EF444420', border: 'none', color: '#EF4444', borderRadius: 6, padding: '2px 8px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit' }}>
+                              Remove
+                            </button>
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                            <div>
+                              <div style={{ fontSize: 10, color: t.textLow, marginBottom: 3 }}>MAX HOURS</div>
+                              <input type="number" min={0.5} max={48} step={0.5} placeholder="e.g. 12"
+                                value={rule.maxHours ?? ''}
+                                onChange={(e) => {
+                                  const r = [...editRules];
+                                  r[rIdx] = { ...r[rIdx], maxHours: e.target.value ? Number(e.target.value) : null };
+                                  setEditRules(r);
+                                }}
+                                style={{ ...S.input, fontSize: 13 }} className="inp" />
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, justifyContent: 'center', paddingTop: 14 }}>
+                              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12, color: t.textMid }}>
+                                <input type="checkbox" checked={!!rule.bypassOnWeekend}
+                                  onChange={(e) => {
+                                    const r = [...editRules];
+                                    r[rIdx] = { ...r[rIdx], bypassOnWeekend: e.target.checked };
+                                    setEditRules(r);
+                                  }} />
+                                Bypass on weekends
+                              </label>
+                              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12, color: t.textMid }}>
+                                <input type="checkbox" checked={!!rule.weekendOnly}
+                                  onChange={(e) => {
+                                    const r = [...editRules];
+                                    r[rIdx] = { ...r[rIdx], weekendOnly: e.target.checked };
+                                    setEditRules(r);
+                                  }} />
+                                Weekends only
+                              </label>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                      <button
+                        onClick={() => setEditRules([...editRules, { maxHours: 12, bypassOnWeekend: false, weekendOnly: false }])}
+                        style={{ ...S.pill, background: t.bg0, border: '1px dashed ' + t.border, color: t.textLow, cursor: 'pointer', justifyContent: 'center', padding: '8px 0', fontSize: 11 }}>
+                        + Add rule
+                      </button>
+                    </div>
                   </div>
                   <div style={{ display: 'flex', gap: 8 }}>
                     <button
@@ -5853,10 +6072,8 @@ function makeCss(t) {
       t.textLow +
       ';letter-spacing:0.2px;}',
     '#root{width:100%;height:100%;}',
-    '*{box-sizing:border-box;margin:0;padding:0;-webkit-user-select:none;user-select:none;}',
+    '*{box-sizing:border-box;margin:0;padding:0;}',
     '::-webkit-scrollbar{display:none;}',
-    'input,textarea,select{user-select:text;-webkit-user-select:text;}',
-    'input,textarea{-webkit-user-select:auto;}',
     '.noScroll{scrollbar-width:none;}',
     ".mono{font-family:'IBM Plex Mono',monospace;}",
     '.view{padding-bottom:100px;}',
