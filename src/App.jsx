@@ -363,7 +363,7 @@ export default function App() {
         /* silent */
       }
     }
-    const pollInterval = setInterval(poll, 5000);
+    const pollInterval = setInterval(poll, 30000);
 
     return () => {
       ch.unsubscribe();
