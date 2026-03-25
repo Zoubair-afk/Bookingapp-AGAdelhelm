@@ -246,7 +246,12 @@ export default function App() {
         if (accs) setAccounts(accs);
       } catch (e) { /* silent */ }
     }
-    src/App.jsx
+    const pollInterval = setInterval(poll, 30000); // every 30s instead of 5s
+
+    return () => {
+      ch.unsubscribe();
+      clearInterval(pollInterval);
+    };
   }, []);
 
   function showToast(msg, type = 'success') {
