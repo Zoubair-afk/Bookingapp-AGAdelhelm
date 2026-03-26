@@ -23,7 +23,7 @@ const ACCOUNT_LOGIN_COLUMNS = `${ACCOUNT_LIST_COLUMNS}, password_hash`;
 const INSTRUMENT_COLUMNS = 'id, name, code, category, color, icon, max_days, rules';
 const BOOKING_COLUMNS =
   'id, group_id, instrument_id, user_display_name, date, start_time, end_time, note, cancelled, recurring';
-const BOOKING_WINDOW_DAYS = 60;
+const BOOKING_WINDOW_DAYS = 14;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function genId() {
@@ -184,6 +184,8 @@ export default function App() {
     return () => clearInterval(tick);
   }, []);
   const realtimeRef = useRef(null);
+  const currentAccountRef = useRef(null);
+  const instrumentsRef = useRef([]);
 
   function endDateStr(daysAhead = BOOKING_WINDOW_DAYS) {
     const d = new Date();
@@ -224,12 +226,28 @@ export default function App() {
 
   const currentAccount =
     accounts.find((a) => a.id === session?.accountId) ?? null;
+
+  useEffect(() => {
+    currentAccountRef.current = currentAccount;
+  }, [currentAccount]);
+
+  useEffect(() => {
+    instrumentsRef.current = instruments;
+  }, [instruments]);
   // Treat null/undefined status as 'approved' for backwards compatibility
   const currentStatus = currentAccount?.status ?? 'approved';
   const activeBookings = bookings.filter((b) => !b.cancelled);
 
   useEffect(() => {
     loadAll();
+  }, [session?.accountId]);
+
+  useEffect(() => {
+    function onVisible() {
+      if (!document.hidden) loadAll();
+    }
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
   }, [session?.accountId]);
 
   async function loadAll() {
@@ -285,8 +303,10 @@ export default function App() {
             );
             return next;
           });
-          if (row.user_display_name !== currentAccount?.display_name)
-            pushNotif(`📅 ${row.user_display_name} booked ${instruments.find((i) => i.id === row.instrument_id)?.name ?? ''} on ${fmtDate(row.date)}`);
+          if (row.user_display_name !== currentAccountRef.current?.display_name) {
+            const instName = instrumentsRef.current.find((i) => i.id === row.instrument_id)?.name ?? '';
+            pushNotif(`📅 ${row.user_display_name} booked ${instName} on ${fmtDate(row.date)}`);
+          }
         }
         if (type === 'UPDATE') {
           setBookings((p) => p.map((b) => (b.id === row.id ? row : b)));
@@ -294,12 +314,6 @@ export default function App() {
         if (type === 'DELETE') {
           setBookings((p) => p.filter((b) => b.id !== old.id));
         }
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'instruments' }, (payload) => {
-        const { eventType: type, new: row, old } = payload;
-        if (type === 'INSERT') setInstruments((p) => [...p, row].sort((a, b) => a.name.localeCompare(b.name)));
-        if (type === 'UPDATE') setInstruments((p) => p.map((i) => (i.id === row.id ? row : i)));
-        if (type === 'DELETE') setInstruments((p) => p.filter((i) => i.id !== old.id));
       });
 
     if (currentAccount?.is_admin) {
@@ -317,7 +331,7 @@ export default function App() {
     return () => {
       ch.unsubscribe();
     };
-  }, [currentAccount?.id, currentAccount?.is_admin, currentAccount?.display_name, instruments]);
+  }, [currentAccount?.id, currentAccount?.is_admin]);
 
   function showToast(msg, type = 'success') {
     setToast({ msg, type, id: genId() });
