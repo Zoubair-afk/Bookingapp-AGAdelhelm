@@ -184,14 +184,6 @@ export default function App() {
     return () => clearInterval(tick);
   }, []);
   const realtimeRef = useRef(null);
-  const currentAccountRef = useRef(null);
-  const instrumentsRef = useRef([]);
-  useEffect(() => {
-    currentAccountRef.current = currentAccount;
-  }, [currentAccount]);
-  useEffect(() => {
-    instrumentsRef.current = instruments;
-  }, [instruments]);
 
   function endDateStr(daysAhead = BOOKING_WINDOW_DAYS) {
     const d = new Date();
@@ -275,87 +267,49 @@ export default function App() {
   useEffect(() => {
     if (document.hidden) return undefined;
 
-    if (!currentAccount?.is_admin) {
-      realtimeRef.current = null;
-      return undefined;
-    }
-
+    const channelName = currentAccount?.is_admin ? 'public:admin-live' : 'public:user-live';
     const ch = sb
-      .channel('public:admin-live')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'bookings' },
-        (payload) => {
-          const { eventType: type, new: row, old } = payload;
-          if (row?.date && (row.date < todayStr || row.date > endDateStr())) return;
+      .channel(channelName)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bookings' }, async (payload) => {
+        const { eventType: type, new: row, old } = payload;
+        if (row?.date && (row.date < todayStr || row.date > endDateStr())) return;
 
-          if (type === 'INSERT') {
-            setBookings((p) => {
-              if (p.some((b) => b.id === row.id)) return p;
-              const next = [...p, row];
-              next.sort((a, b) =>
-                a.date === b.date
-                  ? a.start_time.localeCompare(b.start_time)
-                  : a.date.localeCompare(b.date)
-              );
-              return next;
-            });
-
-            const liveAccount = currentAccountRef.current;
-            const instName =
-              instrumentsRef.current.find((i) => i.id === row.instrument_id)?.name ?? '';
-            if (row.user_display_name !== liveAccount?.display_name) {
-              pushNotif(
-                `📅 ${row.user_display_name} booked ${instName} on ${fmtDate(row.date)}`
-              );
-            }
-          }
-
-          if (type === 'UPDATE') {
-            setBookings((p) => p.map((b) => (b.id === row.id ? row : b)));
-          }
-
-          if (type === 'DELETE') {
-            setBookings((p) => p.filter((b) => b.id !== old.id));
-          }
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'instruments' },
-        (payload) => {
-          const { eventType: type, new: row, old } = payload;
-          if (type === 'INSERT') {
-            setInstruments((p) =>
-              [...p, row].sort((a, b) => a.name.localeCompare(b.name))
+        if (type === 'INSERT') {
+          setBookings((p) => {
+            if (p.some((b) => b.id === row.id)) return p;
+            const next = [...p, row];
+            next.sort((a, b) =>
+              a.date === b.date
+                ? a.start_time.localeCompare(b.start_time)
+                : a.date.localeCompare(b.date)
             );
-          }
-          if (type === 'UPDATE') {
-            setInstruments((p) => p.map((i) => (i.id === row.id ? row : i)));
-          }
-          if (type === 'DELETE') {
-            setInstruments((p) => p.filter((i) => i.id !== old.id));
-          }
+            return next;
+          });
+          if (row.user_display_name !== currentAccount?.display_name)
+            pushNotif(`📅 ${row.user_display_name} booked ${instruments.find((i) => i.id === row.instrument_id)?.name ?? ''} on ${fmtDate(row.date)}`);
         }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'accounts' },
-        (payload) => {
-          const { eventType: type, new: row, old } = payload;
-          if (type === 'INSERT') {
-            setAccounts((p) =>
-              [...p, row].sort((a, b) => a.display_name.localeCompare(b.display_name))
-            );
-          }
-          if (type === 'UPDATE') {
-            setAccounts((p) => p.map((a) => (a.id === row.id ? row : a)));
-          }
-          if (type === 'DELETE') {
-            setAccounts((p) => p.filter((a) => a.id !== old.id));
-          }
+        if (type === 'UPDATE') {
+          setBookings((p) => p.map((b) => (b.id === row.id ? row : b)));
         }
-      );
+        if (type === 'DELETE') {
+          setBookings((p) => p.filter((b) => b.id !== old.id));
+        }
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'instruments' }, (payload) => {
+        const { eventType: type, new: row, old } = payload;
+        if (type === 'INSERT') setInstruments((p) => [...p, row].sort((a, b) => a.name.localeCompare(b.name)));
+        if (type === 'UPDATE') setInstruments((p) => p.map((i) => (i.id === row.id ? row : i)));
+        if (type === 'DELETE') setInstruments((p) => p.filter((i) => i.id !== old.id));
+      });
+
+    if (currentAccount?.is_admin) {
+      ch.on('postgres_changes', { event: '*', schema: 'public', table: 'accounts' }, (payload) => {
+        const { eventType: type, new: row, old } = payload;
+        if (type === 'INSERT') setAccounts((p) => [...p, row].sort((a, b) => a.display_name.localeCompare(b.display_name)));
+        if (type === 'UPDATE') setAccounts((p) => p.map((a) => (a.id === row.id ? row : a)));
+        if (type === 'DELETE') setAccounts((p) => p.filter((a) => a.id !== old.id));
+      });
+    }
 
     ch.subscribe();
     realtimeRef.current = ch;
@@ -363,17 +317,7 @@ export default function App() {
     return () => {
       ch.unsubscribe();
     };
-  }, [currentAccount?.id, currentAccount?.is_admin]);
-
-  useEffect(() => {
-    function onVisible() {
-      if (!document.hidden) {
-        loadAll();
-      }
-    }
-    document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [session?.accountId]);
+  }, [currentAccount?.id, currentAccount?.is_admin, currentAccount?.display_name, instruments]);
 
   function showToast(msg, type = 'success') {
     setToast({ msg, type, id: genId() });
